@@ -110,7 +110,7 @@ h1 {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px;
   margin-bottom: 22px;
 }
@@ -184,7 +184,8 @@ label {
   font-size: 12px;
   color: var(--muted);
 }
-select {
+select,
+input {
   min-width: 160px;
   padding: 8px 10px;
   border: 1px solid var(--line);
@@ -208,6 +209,7 @@ select {
   color: var(--muted);
 }
 .tag.on { border-color: var(--accent); color: var(--accent); }
+.muted { color: var(--muted); font-size: 12px; }
 
 @media (max-width: 800px) {
   .topbar, .content, .ribbon { padding-left: 16px; padding-right: 16px; }

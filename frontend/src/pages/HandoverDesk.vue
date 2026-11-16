@@ -6,16 +6,21 @@ const shifts = ref([])
 const fromId = ref(1)
 const toId = ref(2)
 const current = ref(null)
+const activeCompensation = ref(null)
 const msg = ref('')
 const ok = ref(false)
 
 async function refresh() {
   shifts.value = await getJson('/api/shifts')
-  const logs = await getJson('/api/handovers')
+  const [logs, comps] = await Promise.all([
+    getJson('/api/handovers'),
+    getJson('/api/compensations'),
+  ])
   current.value = logs.find((h) => h.status === '进行中') || null
   if (current.value) {
     current.value = await getJson(`/api/handovers/${current.value.id}`)
   }
+  activeCompensation.value = comps.find((c) => c.status === '进行中') || null
 }
 
 onMounted(async () => {
@@ -62,7 +67,14 @@ async function complete() {
 <template>
   <div>
     <h1>交班办理</h1>
-    <p class="lead">同一时刻只允许一单进行中的交班；清单内在途批次必须整批过户，禁止只改单据不改归属。</p>
+    <p class="lead">同一时刻只允许一单进行中的交班；清单内在途批次必须整批过户，禁止只改单据不改归属。补偿单进行中时不能发起或完成交班。</p>
+
+    <div class="panel" v-if="activeCompensation">
+      <h2>补偿单 #{{ activeCompensation.id }} 进行中</h2>
+      <p class="lead" style="margin-bottom: 0">
+        {{ activeCompensation.related_doc_no }} 的回拨尚未完成，处理完成前不能发起正向交班。
+      </p>
+    </div>
 
     <div class="panel">
       <div class="row">
@@ -76,8 +88,8 @@ async function complete() {
             <option v-for="s in shifts" :key="'t'+s.id" :value="s.id">{{ s.name }} · {{ s.keeper }}</option>
           </select>
         </label>
-        <button class="btn" :disabled="!!current" @click="start">发起交班</button>
-        <button class="btn ghost" :disabled="!current" @click="complete">完成交班</button>
+        <button class="btn" :disabled="!!current || !!activeCompensation" @click="start">发起交班</button>
+        <button class="btn ghost" :disabled="!current || !!activeCompensation" @click="complete">完成交班</button>
       </div>
       <p class="msg" :class="{ ok }">{{ msg }}</p>
     </div>

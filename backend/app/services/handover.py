@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
-from app.db import connect, rows_to_dicts
+from app.db import connect, rows_to_dicts, transaction
 
 
 def _now() -> str:
@@ -18,28 +18,29 @@ def list_shifts() -> list[dict]:
 
 
 def list_batches(owner_shift_id: int | None = None) -> list[dict]:
+    owner_filter = "" if owner_shift_id is None else "WHERE b.owner_shift_id = ?"
+    params: tuple = () if owner_shift_id is None else (owner_shift_id,)
     with connect() as conn:
-        if owner_shift_id is None:
-            rows = conn.execute(
-                """
-                SELECT b.*, s.name AS owner_shift_name
-                FROM batches b
-                LEFT JOIN shifts s ON s.id = b.owner_shift_id
-                ORDER BY b.id
-                """
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT b.*, s.name AS owner_shift_name
-                FROM batches b
-                LEFT JOIN shifts s ON s.id = b.owner_shift_id
-                WHERE b.owner_shift_id = ?
-                ORDER BY b.id
-                """,
-                (owner_shift_id,),
-            ).fetchall()
-        return rows_to_dicts(rows)
+        rows = conn.execute(
+            f"""
+            SELECT b.*, s.name AS owner_shift_name,
+                   EXISTS(
+                     SELECT 1
+                     FROM compensation_items ci
+                     JOIN compensations c ON c.id = ci.compensation_id
+                     WHERE ci.batch_id = b.id AND c.status = '进行中'
+                   ) AS compensation_pending
+            FROM batches b
+            LEFT JOIN shifts s ON s.id = b.owner_shift_id
+            {owner_filter}
+            ORDER BY b.id
+            """,
+            params,
+        ).fetchall()
+        out = rows_to_dicts(rows)
+        for d in out:
+            d["compensation_pending"] = bool(d["compensation_pending"])
+        return out
 
 
 def list_handovers() -> list[dict]:
@@ -55,7 +56,13 @@ def list_handovers() -> list[dict]:
             ORDER BY h.id DESC
             """
         ).fetchall()
-        return rows_to_dicts(rows)
+        out = rows_to_dicts(rows)
+        for d in out:
+            d["doc_type"] = "正向交班"
+            d["kind"] = "forward"
+            d["doc_no"] = f"交班单#{d['id']}"
+            d["related_doc_no"] = None
+        return out
 
 
 def get_handover(handover_id: int) -> dict:
@@ -85,6 +92,10 @@ def get_handover(handover_id: int) -> dict:
             (handover_id,),
         ).fetchall()
         out = dict(h)
+        out["doc_type"] = "正向交班"
+        out["kind"] = "forward"
+        out["doc_no"] = f"交班单#{handover_id}"
+        out["related_doc_no"] = None
         out["items"] = rows_to_dicts(items)
         return out
 
@@ -98,6 +109,9 @@ def dashboard() -> dict:
         active = conn.execute(
             "SELECT COUNT(*) AS c FROM handovers WHERE status = '进行中'"
         ).fetchone()["c"]
+        active_comp = conn.execute(
+            "SELECT COUNT(*) AS c FROM compensations WHERE status = '进行中'"
+        ).fetchone()["c"]
         last = conn.execute(
             "SELECT * FROM handovers ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -105,6 +119,7 @@ def dashboard() -> dict:
             "班次数": len(shifts),
             "在途批次数": inflight,
             "进行中交班": active,
+            "进行中补偿": active_comp,
             "最近交班": dict(last) if last else None,
             "班次": shifts,
         }
@@ -113,7 +128,7 @@ def dashboard() -> dict:
 def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
     if from_shift_id == to_shift_id:
         raise HTTPException(400, "交班双方不能是同一班次")
-    with connect() as conn:
+    with transaction() as conn:
         fs = conn.execute("SELECT * FROM shifts WHERE id = ?", (from_shift_id,)).fetchone()
         ts = conn.execute("SELECT * FROM shifts WHERE id = ?", (to_shift_id,)).fetchone()
         if not fs or not ts:
@@ -123,6 +138,14 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
         ).fetchone()
         if active:
             raise HTTPException(409, f"已有进行中的交班单#{active['id']}，禁止并行交班")
+        active_comp = conn.execute(
+            "SELECT id FROM compensations WHERE status = '进行中' LIMIT 1"
+        ).fetchone()
+        if active_comp:
+            raise HTTPException(
+                409,
+                f"补偿单#{active_comp['id']} 正在进行中，禁止同时发起正向交班",
+            )
         batches = conn.execute(
             "SELECT id FROM batches WHERE owner_shift_id = ? AND status = '在途' ORDER BY id",
             (from_shift_id,),
@@ -144,17 +167,24 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
             )
         conn.execute("UPDATE shifts SET status = '交班中' WHERE id = ?", (from_shift_id,))
         conn.execute("UPDATE shifts SET status = '接班中' WHERE id = ?", (to_shift_id,))
-        conn.commit()
     return get_handover(hid)
 
 
 def complete_handover(handover_id: int) -> dict:
-    with connect() as conn:
+    with transaction() as conn:
         h = conn.execute("SELECT * FROM handovers WHERE id = ?", (handover_id,)).fetchone()
         if not h:
             raise HTTPException(404, "交班单不存在")
         if h["status"] != "进行中":
             raise HTTPException(400, "只能完成进行中的交班单")
+        active_comp = conn.execute(
+            "SELECT id FROM compensations WHERE status = '进行中' LIMIT 1"
+        ).fetchone()
+        if active_comp:
+            raise HTTPException(
+                409,
+                f"补偿单#{active_comp['id']} 正在进行中，禁止同时完成正向交班",
+            )
         items = conn.execute(
             "SELECT batch_id FROM handover_items WHERE handover_id = ?",
             (handover_id,),
@@ -202,8 +232,8 @@ def complete_handover(handover_id: int) -> dict:
             """
             INSERT INTO reconcile_reports(
               handover_id, before_count, after_from_count, after_to_count,
-              consistent, detail_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+              consistent, detail_json, created_at, doc_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, '正向交班')
             """,
             (
                 handover_id,
@@ -215,7 +245,6 @@ def complete_handover(handover_id: int) -> dict:
                 _now(),
             ),
         )
-        conn.commit()
     return get_handover(handover_id)
 
 
@@ -229,5 +258,12 @@ def list_reconcile() -> list[dict]:
             d = dict(r)
             d["detail"] = json.loads(d.pop("detail_json"))
             d["一致"] = bool(d.pop("consistent"))
+            d["doc_type"] = d.get("doc_type") or "正向交班"
+            if d["doc_type"] == "补偿回拨":
+                d["doc_no"] = f"补偿单#{d['compensation_id']}"
+                d["related_doc_no"] = f"交班单#{d['handover_id']}"
+            else:
+                d["doc_no"] = f"交班单#{d['handover_id']}"
+                d["related_doc_no"] = None
             out.append(d)
         return out
